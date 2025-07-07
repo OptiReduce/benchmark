@@ -20,7 +20,8 @@ from utils import (
     calculate_classification_accuracy,
     calculate_span_prediction_accuracy,
     hadamard_hook_cuda,
-    is_hadamard_available
+    is_hadamard_available,
+    thc_compress_hook
 )
 
 def train(args, file_prefix):
@@ -50,7 +51,22 @@ def train(args, file_prefix):
             raise ImportError("CUDA Hadamard transform is not available. Install hadamard_cuda.")        
         # Register Hadamard communication hook if enabled
         model.register_comm_hook(model.process_group, hadamard_hook_cuda)
-    
+
+    if args.uhc:
+        params = {}
+        params["nclients"] = args.nodes
+        params["d"] = {}
+        params["size"] = {}
+        params["device"] = "cuda:0"
+        params["ef"] = False
+        params["proportion"] = 0.001
+        params["compression_method"] = "uhc"
+        params["args"] = args
+        params["quantization_levels"] = args.quantization_levels
+        params["partial_rotation_times"] = args.partial_rotation_times
+        hook_state = {"batch_idx": -1, "params": params, "start_idx": {}, "partition_len": {}, "ret_tensor": {}, "start_interm_idx": {}, "interm_reduce_tensor": {}, "args": args}
+        model.register_comm_hook(state=[hook_state], hook=thc_compress_hook)
+
     # Dataloader setup
     train_sampler = DistributedSampler(dataset, num_replicas=args.nodes)
     train_loader = DataLoader(dataset=dataset,

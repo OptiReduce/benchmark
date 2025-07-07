@@ -4,14 +4,100 @@ import pandas as pd
 from datetime import timedelta
 import torch.distributed as dist
 
+from compressor import UHCCompressor
+from torch import Future
+
 try:
     from hadamard_cuda import hadamard_transform
 except ImportError:
     hadamard_transform = None
 
+INTEG_PARTITION_LAYER = 3
+CHUNK_SIZE_THRESHOLD = 1 << 23 # 2^24 for language tasks and 2^23 for image tasks
+
 _initialized = False
 _random_diag_encode = None
 _random_diag_decode = None
+
+def thc_compress_hook(
+    state, bucket: dist.GradBucket
+) -> torch.futures.Future[torch.Tensor]:
+    """
+    This DDP communication hook implements a simple gradient compression
+    approach that casts ``GradBucket`` tensor to half-precision floating-point format (``torch.float16``)
+    and then divides it by the process group size.
+    It allreduces those ``float16`` gradient tensors. Once compressed gradient
+    tensors are allreduced, the chained callback ``decompress`` casts it back to the input data type (such as ``float32``).
+
+    Example::
+        >>> # xdoctest: +SKIP
+        >>> ddp_model.register_comm_hook(process_group, fp16_compress_hook)
+    """
+    
+    def compress_reduce_decompress(l, r, index, i, max_norm):
+        compressed_vec = state["compressor"].compress(vec[l:r], (index, i), max_norm)
+        reduced_fut = dist.all_reduce(compressed_vec, async_op=True, op=dist.ReduceOp.SUM).get_future()
+        return reduced_fut.then(\
+            lambda fut: ret_tensor[l:r].copy_(state["compressor"].decompress(fut.value()[0], (index, i), max_norm)))
+
+    def return_func(fut):
+        return ret_tensor
+    
+    state = state[0]
+    if state["batch_idx"] == 0:
+        return (
+            dist.all_reduce(bucket.buffer(), async_op=True)
+            .get_future()
+            .then(lambda fut: fut.value()[0])
+        )
+        
+    else:
+        index = bucket.index()
+        vec = bucket.buffer()
+        total_size = vec.numel()
+
+        # Lazy init if this is the first time we see this bucket index
+        if index not in state["partition_len"]:
+            orig_total_size = total_size
+            i = 0
+            while True:
+                if i >= INTEG_PARTITION_LAYER - 1 and total_size <= CHUNK_SIZE_THRESHOLD:
+                    cur_size = total_size
+                    cur_d = cur_size if (1 << (total_size.bit_length() - 1)) == cur_size else (1 << (total_size.bit_length()))
+                else:
+                    cur_size = min(1 << (total_size.bit_length() - 1), CHUNK_SIZE_THRESHOLD)
+                    cur_d = cur_size
+
+                state["params"]["d"][(index, i)] = cur_d
+                state["params"]["size"][(index, i)] = cur_size
+                state["start_idx"][(index, i)] = orig_total_size - total_size
+                total_size -= cur_size
+                i += 1
+                if total_size == 0:
+                    break
+
+            state["partition_len"][index] = i
+            state["ret_tensor"][index] = torch.zeros((orig_total_size), dtype=vec.dtype, device=vec.device)
+            state["compressor"]: UHCCompressor = UHCCompressor(state["params"])
+
+        ret_tensor = state["ret_tensor"][index]
+        max_norms = []
+        futures = []
+
+        for i in range(state["partition_len"][index]):
+            l = state["start_idx"][(index, i)]
+            r = l + state["params"]["size"][(index, i)]
+            self_norm = vec[l:r].norm(2).view(-1)
+            max_norms.append(self_norm.item())
+        max_norms = dist.all_reduce(torch.tensor(max_norms, device=state["params"]["device"]), async_op=True, op=dist.ReduceOp.MAX).get_future().wait()[0].tolist()
+
+        for i in range(state["partition_len"][index]):
+            l = state["start_idx"][(index, i)]
+            r = l + state["params"]["size"][(index, i)]
+            cur_future = compress_reduce_decompress(l, r, index, i, max_norms[i])
+            futures.append(cur_future)
+
+        return torch.futures.collect_all(futures).then(return_func)
 
 def is_hadamard_available():
     return hadamard_transform is not None

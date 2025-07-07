@@ -70,25 +70,25 @@ if [ "$RUN_ALL" = "1" ]; then
     echo "Running all communication schemes..."
 
     # NCCL schemes
-    NCCL_IB_DISABLE=1 $BASE_COMMAND --algo ring --comm nccl
+    NCCL_IB_DISABLE=1 $BASE_COMMAND --algo ring --comm nccl --uhc
     sleep 5
 
-    NCCL_IB_DISABLE=1 $BASE_COMMAND --algo tree --comm nccl
+    NCCL_IB_DISABLE=1 $BASE_COMMAND --algo tree --comm nccl --uhc
     sleep 5
 
     # Gloo schemes
-    $BASE_COMMAND --algo ring
+    $BASE_COMMAND --algo ring --uhc
     sleep 5
 
-    $BASE_COMMAND --algo bcube
+    $BASE_COMMAND --algo bcube --uhc
     sleep 5
 
-    $BASE_COMMAND --algo transpose
+    $BASE_COMMAND --algo transpose --uhc
     sleep 5
 fi
 
 # Always run OptiReduce
 echo "Running OptiReduce..."
-taskset -c 1-8 $BASE_COMMAND --algo optireduce --tr_timeout $TR_TIMEOUT --tr_threads_offset 11
+taskset -c 1-8 $BASE_COMMAND --algo optireduce --tr_timeout $TR_TIMEOUT --tr_threads_offset 11 --uhc
 
 echo "All commands executed."
